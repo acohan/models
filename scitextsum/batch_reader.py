@@ -28,19 +28,61 @@ import tensorflow as tf
 
 import data
 
-ModelInput = namedtuple('ModelInput',
-                        'enc_input dec_input target enc_len dec_len '
-                        'origin_article origin_abstract')
+# ModelInput = namedtuple('ModelInput',
+#                         'enc_input dec_input target enc_len dec_len '
+#                         'origin_article origin_abstract')
+
+class ModelInput(object):
+  
+  def __init__(self,
+               enc_input, dec_input, target, enc_len, dec_len,
+               original_article, original_abstract, article_id):
+    self.enc_input = enc_input
+    self.dec_input = dec_input
+    self.target = target
+    self.enc_len = enc_len
+    self.dec_len = dec_len
+    self.original_article = original_article
+    self.original_abstract = original_abstract
+    self.article_id = article_id
 
 BUCKET_CACHE_BATCH = 100
 QUEUE_NUM_BATCH = 100
 
+# To represent list of sections as string and retrieve it back
+SECTION_SEPARATOR = ' <SCTN/> '
+
+# to represent separator as string, end of item (ei)
+LIST_SEPARATOR = ' <EI/> '
+
+
+def _string_to_list(s, dtype='str'):
+  """ converts string to list
+  Args:
+    s: input
+    dtype: specifies the type of elements in the list
+      can be one of `str` or `int`
+  """
+  if dtype == 'str':
+    return s.split(LIST_SEPARATOR)
+  elif dtype == 'int':
+    return [int(e) for e in s.split(LIST_SEPARATOR) if e]
+
+
+def _string_to_nested_list(s):
+  return [e.split(LIST_SEPARATOR)
+          for e in s.split(SECTION_SEPARATOR)]
 
 class Batcher(object):
   """Batch reader with shuffling and bucketing support."""
 
   def __init__(self, data_path, vocab, hps,
-               article_key, abstract_key, max_article_sentences,
+               article_id_key,
+               article_key, abstract_key,
+               labels_key,
+               section_names_key,
+               sections_key,
+               max_article_sentences,
                max_abstract_sentences, bucketing=True, truncate_input=False):
     """Batcher constructor.
 
@@ -48,8 +90,12 @@ class Batcher(object):
       data_path: tf.Example filepattern.
       vocab: Vocabulary.
       hps: Seq2SeqAttention model hyperparameters.
+      article_id_key: article id key in tf.Example
       article_key: article feature key in tf.Example.
       abstract_key: abstract feature key in tf.Example.
+      labels_key: labels feature key in tf.Example,
+      section_names_key: section names key in tf.Example,
+      sections_key: sections key in tf.Example,
       max_article_sentences: Max number of sentences used from article.
       max_abstract_sentences: Max number of sentences used from abstract.
       bucketing: Whether bucket articles of similar length into the same batch.
@@ -59,8 +105,12 @@ class Batcher(object):
     self._data_path = data_path
     self._vocab = vocab
     self._hps = hps
+    self._article_id_key = article_id_key
     self._article_key = article_key
     self._abstract_key = abstract_key
+    self._labels_key = labels_key
+    self._section_names_key = section_names_key
+    self._sections_key = sections_key
     self._max_article_sentences = max_article_sentences
     self._max_abstract_sentences = max_abstract_sentences
     self._bucketing = bucketing
@@ -69,16 +119,16 @@ class Batcher(object):
     self._bucket_input_queue = Queue.Queue(QUEUE_NUM_BATCH)
     self._input_threads = []
     for _ in xrange(16):
-      self._input_threads.append(Thread(target=self._FillInputQueue))
+      self._input_threads.append(Thread(target=self._fill_input_queue))
       self._input_threads[-1].daemon = True
       self._input_threads[-1].start()
     self._bucketing_threads = []
     for _ in xrange(4):
-      self._bucketing_threads.append(Thread(target=self._FillBucketInputQueue))
+      self._bucketing_threads.append(Thread(target=self._fill_bucket_input_queue))
       self._bucketing_threads[-1].daemon = True
       self._bucketing_threads[-1].start()
 
-    self._watch_thread = Thread(target=self._WatchThreads)
+    self._watch_thread = Thread(target=self._watch_threads)
     self._watch_thread.daemon = True
     self._watch_thread.start()
 
@@ -109,11 +159,18 @@ class Batcher(object):
         (self._hps.batch_size, self._hps.dec_timesteps), dtype=np.float32)
     origin_articles = ['None'] * self._hps.batch_size
     origin_abstracts = ['None'] * self._hps.batch_size
+    article_ids = ['None'] * self._hps.batch_size
 
     buckets = self._bucket_input_queue.get()
     for i in xrange(self._hps.batch_size):
-      (enc_inputs, dec_inputs, targets, enc_input_len, dec_output_len,
-       article, abstract) = buckets[i]
+      enc_inputs= buckets[i].enc_input
+      dec_inputs = buckets[i].dec_input
+      targets = buckets[i].target
+      enc_input_len = buckets[i].enc_len
+      dec_output_len = buckets[i].dec_len
+      article = buckets[i].original_article
+      abstract = buckets[i].original_abstract
+
 
       origin_articles[i] = article
       origin_abstracts[i] = abstract
@@ -124,33 +181,43 @@ class Batcher(object):
       target_batch[i, :] = targets[:]
       for j in xrange(dec_output_len):
         loss_weights[i][j] = 1
+      article_ids[i] = buckets[i].article_id
     return (enc_batch, dec_batch, target_batch, enc_input_lens, dec_output_lens,
-            loss_weights, origin_articles, origin_abstracts)
+            loss_weights, origin_articles, origin_abstracts, article_ids)
 
-  def _FillInputQueue(self):
-    """Fill input queue with ModelInput."""
+  def _fill_input_queue(self):
+    """Fill input queue with ModelInput.
+    Reads data from file and processess into tf.Examples which are then
+    placed into the input queue"""
+    
     start_id = self._vocab.WordToId(data.SENTENCE_START)
     end_id = self._vocab.WordToId(data.SENTENCE_END)
     pad_id = self._vocab.WordToId(data.PAD_TOKEN)
-    input_gen = self._TextGenerator(data.ExampleGen(self._data_path))
-    while True:
-      (article, abstract) = six.next(input_gen)
-      article_sentences = [sent.strip() for sent in
-                           data.ToSentences(str(article), include_token=False)]
-      abstract_sentences = [sent.strip() for sent in
-                            data.ToSentences(str(abstract), include_token=False)]
+    input_gen = self._data_generator(data.ExampleGen(self._data_path))
 
+    while True:
+      (article_id, article, abstract, labels, section_names, sections) =\
+        six.next(input_gen)
+        
+      
+#       article_sentences = [sent.strip() for sent in
+#                            data.ToSentences(article, include_token=False)]
+#       abstract_sentences = [sent.strip() for sent in
+#                             data.ToSentences(abstract, include_token=False)]
+
+      article_sentences = article
+      abstract_sentences = abstract
       enc_inputs = []
       # Use the <s> as the <GO> symbol for decoder inputs.
       dec_inputs = [start_id]
-
+      
       # Convert first N sentences to word IDs, stripping existing <s> and </s>.
       for i in xrange(min(self._max_article_sentences,
                           len(article_sentences))):
-        enc_inputs += data.GetWordIds(article_sentences[i], self._vocab)
+        enc_inputs += data.get_word_ids(article_sentences[i], self._vocab)
       for i in xrange(min(self._max_abstract_sentences,
                           len(abstract_sentences))):
-        dec_inputs += data.GetWordIds(abstract_sentences[i], self._vocab)
+        dec_inputs += data.get_word_ids(abstract_sentences[i], self._vocab)
 
       # Filter out too-short input
       if (len(enc_inputs) < self._hps.min_input_len or
@@ -193,11 +260,13 @@ class Batcher(object):
 
       element = ModelInput(enc_inputs, dec_inputs, targets, enc_input_len,
                            dec_output_len, ' '.join(article_sentences),
-                           ' '.join(abstract_sentences))
+                           ' '.join(abstract_sentences), article_id)
       self._input_queue.put(element)
 
-  def _FillBucketInputQueue(self):
-    """Fill bucketed batches into the bucket_input_queue."""
+  def _fill_bucket_input_queue(self):
+    """Fill bucketed batches into the bucket_input_queue.
+    Takes Examples out of example queue, sorts them by encoder sequence length
+    processes into Batches and places them in the batch queue."""
     while True:
       inputs = []
       for _ in xrange(self._hps.batch_size * BUCKET_CACHE_BATCH):
@@ -209,10 +278,10 @@ class Batcher(object):
       for i in xrange(0, len(inputs), self._hps.batch_size):
         batches.append(inputs[i:i+self._hps.batch_size])
       shuffle(batches)
-      for b in batches:
+      for b in batches: # each b is a list of Example objects
         self._bucket_input_queue.put(b)
 
-  def _WatchThreads(self):
+  def _watch_threads(self):
     """Watch the daemon input threads and restart if dead."""
     while True:
       time.sleep(60)
@@ -222,7 +291,7 @@ class Batcher(object):
           input_threads.append(t)
         else:
           tf.logging.error('Found input thread dead.')
-          new_t = Thread(target=self._FillInputQueue)
+          new_t = Thread(target=self._fill_input_queue)
           input_threads.append(new_t)
           input_threads[-1].daemon = True
           input_threads[-1].start()
@@ -234,26 +303,37 @@ class Batcher(object):
           bucketing_threads.append(t)
         else:
           tf.logging.error('Found bucketing thread dead.')
-          new_t = Thread(target=self._FillBucketInputQueue)
+          new_t = Thread(target=self._fill_bucket_input_queue)
           bucketing_threads.append(new_t)
           bucketing_threads[-1].daemon = True
           bucketing_threads[-1].start()
       self._bucketing_threads = bucketing_threads
 
-  def _TextGenerator(self, example_gen):
+  def _data_generator(self, example_gen):
     """Generates article and abstract text from tf.Example."""
     while True:
       e = six.next(example_gen)
       try:
-        article_text = self._GetExFeatureText(e, self._article_key)
-        abstract_text = self._GetExFeatureText(e, self._abstract_key)
+        article_id = self._get_example_feature(e, self._article_id_key)
+        article_text = self._get_example_feature(e, self._article_key)
+        abstract_text = self._get_example_feature(e, self._abstract_key)
+        labels = self._get_example_feature(e, self._labels_key)
+        section_names = self._get_example_feature(e, self._section_names_key)
+        sections = self._get_example_feature(e, self._sections_key)
+        
+        # convert to list
+        article_text = _string_to_list(article_text)
+        abstract_text = _string_to_list(abstract_text)
+        labels = _string_to_list(labels, dtype='int')
+        section_names = _string_to_list(section_names) 
+        sections = _string_to_nested_list(sections) # list of lists
       except ValueError:
         tf.logging.error('Failed to get article or abstract from example')
         continue
 
-      yield (article_text, abstract_text)
+      yield (article_id, article_text, abstract_text, labels, section_names, sections)
 
-  def _GetExFeatureText(self, ex, key):
+  def _get_example_feature(self, ex, key):
     """Extract text for a feature from td.Example.
 
     Args:
@@ -262,4 +342,5 @@ class Batcher(object):
     Returns:
       feature: a feature text extracted.
     """
-    return ex.features.feature[key].bytes_list.value[0]
+    return ex.features.feature[key].bytes_list.value[0].decode(
+            'utf-8', 'ignore')

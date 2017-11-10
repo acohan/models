@@ -35,8 +35,9 @@ class Hypothesis(object):
     """Hypothesis constructor.
 
     Args:
-      tokens: start tokens for decoding.
+      tokens: start tokens for decoding., list of integers
       log_prob: log prob of the start tokens, usually 1.
+        List, same length as tokens, of floats, giving the log probabilities of the tokens so far.
       state: decoder initial states.
     """
     self.tokens = tokens
@@ -45,9 +46,10 @@ class Hypothesis(object):
 
   def Extend(self, token, log_prob, new_state):
     """Extend the hypothesis with result from latest step.
+    Return a NEW hypothesis, extended with the information from the latest step of beam search.
 
     Args:
-      token: latest token from decoding.
+      token: latest token from decoding, produced by beam search
       log_prob: log prob of the latest decoded tokens.
       new_state: decoder output state. Fed to the decoder for next step.
     Returns:
@@ -69,7 +71,7 @@ class BeamSearch(object):
   """Beam search."""
 
   def __init__(self, model, beam_size, start_token, end_token, max_steps):
-    """Creates BeamSearch object.
+    """Creates run_beam_search object.
 
     Args:
       model: Seq2SeqAttentionModel.
@@ -84,7 +86,7 @@ class BeamSearch(object):
     self._end_token = end_token
     self._max_steps = max_steps
 
-  def BeamSearch(self, sess, enc_inputs, enc_seqlen):
+  def run_beam_search(self, sess, enc_inputs, enc_seqlen):
     """Performs beam search for decoding.
 
     Args:
@@ -98,19 +100,28 @@ class BeamSearch(object):
     """
 
     # Run the encoder and extract the outputs and final state.
-    enc_top_states, dec_in_state = self._model.encode_top_state(
+    # Run the encoder to get the encoder hidden states and decoder initial state
+    print('shape of enc_inputs', enc_inputs.shape)
+    # dec_in_state is a LSTMTupleState with shape [batch, hidden]
+    # enc_top_states has shape [batch, max_enc_steps, 2*hidden_dim]
+    enc_top_states, dec_in_state = self._model.run_encoder(
         sess, enc_inputs, enc_seqlen)
-    print('dec_in_state.shape=', dec_in_state.shape)
+    print('shape of dec_in_state', dec_in_state.c.shape)
+    print('shape of enc_top_states', enc_top_states.shape)   
+    
+    
     # Replicate the initial states K times for the first step.
-    hyps = [Hypothesis([self._start_token], 0.0, dec_in_state)
-           ] * self._beam_size
+    hyps = [Hypothesis([self._start_token], log_prob=0.0, state=dec_in_state)
+           for _ in xrange(self._beam_size)]
     results = []
 
     steps = 0
     while steps < self._max_steps and len(results) < self._beam_size:
       latest_tokens = [h.latest_token for h in hyps]
       states = [h.state for h in hyps]
+      
 
+      
       topk_ids, topk_log_probs, new_states = self._model.decode_topk(
           sess, latest_tokens, enc_top_states, states)
       # Extend each hypothesis.
@@ -139,8 +150,8 @@ class BeamSearch(object):
 
     if steps == self._max_steps:
       results.extend(hyps)
-
-    return self._BestHyps(results)
+    hyps_sorted = self._BestHyps(results)
+    return hyps_sorted[0]
 
   def _BestHyps(self, hyps):
     """Sort the hyps based on log probs and length.
